@@ -14,6 +14,7 @@ namespace SkiaSharpZoomTest
 
 		private SKCanvasView _canvasV = null;
 		private SKMatrix _m = SKMatrix.MakeIdentity();
+		private SKMatrix _currentTransformM = SKMatrix.MakeIdentity();
 		private SKMatrix _startPanM = SKMatrix.MakeIdentity();
 		private SKMatrix _startPinchM = SKMatrix.MakeIdentity();
 		private Point _startPinchAnchor = Point.Zero;
@@ -29,6 +30,7 @@ namespace SkiaSharpZoomTest
 #else
 			_screenScale = (float)UIKit.UIScreen.MainScreen.Scale;
 #endif
+
 			Title = "Layer Performance";
 			_canvasV = new SKCanvasView();
 			_canvasV.PaintSurface += HandlePaintCanvas;
@@ -55,7 +57,7 @@ namespace SkiaSharpZoomTest
 
 		private void HandlePan(object sender, PanUpdatedEventArgs puea)
 		{
-			Debug.WriteLine(puea.StatusType + " (" + puea.TotalX + "," + puea.TotalY + ")");
+			Debug.WriteLine($"{puea.StatusType} ({puea.TotalX},{puea.TotalY})");
 
 			switch (puea.StatusType)
 			{
@@ -68,21 +70,28 @@ namespace SkiaSharpZoomTest
 					float canvasTotalY = (float)puea.TotalY * _screenScale;
 					SKMatrix canvasTranslation = SKMatrix.MakeTranslation(canvasTotalX, canvasTotalY);
 					SKMatrix.Concat(ref _m, ref canvasTranslation, ref _startPanM);
+					_currentTransformM = canvasTranslation;
 					_canvasV.InvalidateSurface();
 					break;
 
 				default:
 					_startPanM = SKMatrix.MakeIdentity();
+
+					// force textLayer to regenerate
+					_textLayer?.Dispose();
+					_textLayer = null;
+					_canvasV.InvalidateSurface();
 					break;
 			}
 		}
 
 		private void HandlePinch(object sender, PinchGestureUpdatedEventArgs puea)
 		{
-			Debug.WriteLine(puea.Status + " (" + puea.ScaleOrigin.X + "," + puea.ScaleOrigin.Y + ") " + puea.Scale);
+			Debug.WriteLine($"{puea.Status} ({puea.ScaleOrigin.X},{puea.ScaleOrigin.Y}) {puea.Scale}");
 
-			Point canvasAnchor = new Point(puea.ScaleOrigin.X * _canvasV.Width * _screenScale,
-										   puea.ScaleOrigin.Y * _canvasV.Height * _screenScale);
+			var canvasAnchor = new Point(
+				puea.ScaleOrigin.X * _canvasV.Width * _screenScale,
+				puea.ScaleOrigin.Y * _canvasV.Height * _screenScale);
 			switch (puea.Status)
 			{
 				case GestureStatus.Started:
@@ -95,6 +104,7 @@ namespace SkiaSharpZoomTest
 					_totalPinchScale *= (float)puea.Scale;
 					SKMatrix canvasScaling = SKMatrix.MakeScale(_totalPinchScale, _totalPinchScale, (float)_startPinchAnchor.X, (float)_startPinchAnchor.Y);
 					SKMatrix.Concat(ref _m, ref canvasScaling, ref _startPinchM);
+					_currentTransformM = canvasScaling;
 					_canvasV.InvalidateSurface();
 					break;
 
@@ -102,7 +112,9 @@ namespace SkiaSharpZoomTest
 					_startPinchM = SKMatrix.MakeIdentity();
 					_startPinchAnchor = Point.Zero;
 					_totalPinchScale = 1f;
-					//Force textLayer to regenerate
+
+					// force textLayer to regenerate
+					_textLayer?.Dispose();
 					_textLayer = null;
 					_canvasV.InvalidateSurface();
 					break;
@@ -111,31 +123,48 @@ namespace SkiaSharpZoomTest
 
 		private void HandlePaintCanvas(object sender, SKPaintSurfaceEventArgs e)
 		{
-			e.Surface.Canvas.SetMatrix(_m);
-			e.Surface.Canvas.Clear();
-			using (var paint = new SKPaint())
+			var canvas = e.Surface.Canvas;
+			var info = e.Info;
+
+			// prepare the surface
+			canvas.Clear();
+
+			// draw the background layer
+			using (new SKAutoCanvasRestore(canvas))
 			{
-				paint.TextSize = 10;
-				paint.Color = SKColors.Red;
-				paint.IsAntialias = true;
-				paint.Style = SKPaintStyle.Fill;
-				paint.TextAlign = SKTextAlign.Center;
-				SKSize imgSize = new SKSize(_bitmap.Width, _bitmap.Height);
-				SKRect aspectRect = SKRect.Create(e.Info.Width, e.Info.Height).AspectFit(imgSize);
-				e.Surface.Canvas.DrawBitmap(_bitmap, aspectRect, paint);
-				if (_textLayer == null)
+				// scale/pan the canvas
+				canvas.SetMatrix(_m);
+
+				// draw the background
+				var imgSize = new SKSize(_bitmap.Width, _bitmap.Height);
+				var aspectRect = SKRect.Create(info.Width, info.Height).AspectFit(imgSize);
+				canvas.DrawBitmap(_bitmap, aspectRect);
+			}
+
+			// create / recreate the text layer
+			if (_textLayer == null)
+			{
+				_textLayer = new SKBitmap(info);
+				using (var layerCanvas = new SKCanvas(_textLayer))
 				{
-					_textLayer = new SKBitmap(e.Info);
-					using (SKCanvas layerCanvas = new SKCanvas(_textLayer))
+					layerCanvas.Clear();
+					layerCanvas.SetMatrix(_m);
+
+					using (var paint = new SKPaint())
 					{
-						layerCanvas.Clear();
+						paint.TextSize = 10;
+						paint.Color = SKColors.Red;
+						paint.IsAntialias = true;
+						paint.Style = SKPaintStyle.Fill;
+						paint.TextAlign = SKTextAlign.Center;
+
 						float curX = 0;
 						float curY = 0;
-						while (curX < e.Info.Width)
+						while (curX < info.Width)
 						{
-							while (curY < e.Info.Height)
+							while (curY < info.Height)
 							{
-								SKRect cell = new SKRect(curX, curY, curX + CELL_DIM, curY + CELL_DIM);
+								var cell = new SKRect(curX, curY, curX + CELL_DIM, curY + CELL_DIM);
 								layerCanvas.DrawText("Hi", cell.MidX, cell.MidY, paint);
 								curY += CELL_DIM;
 							}
@@ -144,7 +173,19 @@ namespace SkiaSharpZoomTest
 						}
 					}
 				}
-				e.Surface.Canvas.DrawBitmap(_textLayer, e.Info.Rect);
+
+				// draw the text layer
+				canvas.DrawBitmap(_textLayer, info.Rect);
+			}
+			else
+			{
+				// draw the old text layer with the new matrix
+				using (new SKAutoCanvasRestore(canvas))
+				{
+					canvas.SetMatrix(_currentTransformM);
+
+					canvas.DrawBitmap(_textLayer, info.Rect);
+				}
 			}
 		}
 	}
